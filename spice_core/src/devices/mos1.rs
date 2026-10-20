@@ -1,10 +1,11 @@
 use crate::circuit::Circuit;
 use crate::devices::Device;
-use crate::devices::devsup::{dev_fetlim, dev_limvds, dev_pnjlim};
+use crate::devices::devsup::{dev_fetlim, dev_limvds, dev_pnjlim, dev_qmeyer};
+use crate::integrate::integrate;
 
 const VT: f64 = 0.02585; // Thermal voltage at 300K
 
-#[derive(PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub enum MosType {
     NMOS,
     PMOS,
@@ -158,11 +159,11 @@ impl Mos1 {
             t_sat_cur: 1e-14,
             t_sat_cur_dens: 0.0,
             t_phi: 0.6,
-            t_vto: 1.0,
+            t_vto: if mos_type == MosType::NMOS { 1.0 } else { -1.0 },
             t_transconductance: 2.0e-5,
             t_bulk_pot: 0.8,
             t_dep_cap: 0.0,
-            t_vbi: 0.8,
+            t_vbi: if mos_type == MosType::NMOS { 1.0 } else { -1.0 },
 
             lambda: 0.0,
             gamma: 0.0,
@@ -295,6 +296,14 @@ impl Device for Mos1 {
         self.source_vcrit = vcrit;
         self.drain_vcrit = vcrit;
 
+        // Precompute flat-band / built-in threshold voltage at nominal temperature (1:1 with MOS1temp)
+        self.type_multiplier = if self.mos_type == MosType::NMOS {
+            1.0
+        } else {
+            -1.0
+        };
+        self.t_vbi = self.t_vto - self.type_multiplier * self.gamma * self.t_phi.sqrt();
+
         Ok(())
     }
 
@@ -402,7 +411,7 @@ impl Device for Mos1 {
 
         self.mode = if vds >= 0.0 { 1 } else { -1 };
 
-        let (mut cdrain, mut von, mut vdsat);
+        let (cdrain, von, vdsat);
         let sarg;
 
         let bulk_v = if self.mode == 1 { vbs } else { vbd };
@@ -462,6 +471,106 @@ impl Device for Mos1 {
         circuit.states[0][self.state_idx + 2] = vgs;
         circuit.states[0][self.state_idx + 3] = vds;
 
+        // Meyer's capacitor model (1:1 with mos1load.c lines 821-955)
+        let vgb = vgs - vbs;
+        let oxide_cap = self.oxide_cap_factor * effective_length * self.w;
+        let gs_ovl_cap = self.gate_source_overlap_cap_factor * self.w;
+        let gd_ovl_cap = self.gate_drain_overlap_cap_factor * self.w;
+        let gb_ovl_cap = self.gate_bulk_overlap_cap_factor * effective_length;
+
+        let mut half_capgs = 0.0;
+        let mut half_capgd = 0.0;
+        let mut half_capgb = 0.0;
+        if self.mode > 0 {
+            dev_qmeyer(
+                vgs,
+                vgd,
+                vgb,
+                von,
+                vdsat,
+                &mut half_capgs,
+                &mut half_capgd,
+                &mut half_capgb,
+                self.t_phi,
+                oxide_cap,
+            );
+        } else {
+            dev_qmeyer(
+                vgd,
+                vgs,
+                vgb,
+                von,
+                vdsat,
+                &mut half_capgd,
+                &mut half_capgs,
+                &mut half_capgb,
+                self.t_phi,
+                oxide_cap,
+            );
+        }
+        circuit.states[0][self.state_idx + 4] = half_capgs;
+        circuit.states[0][self.state_idx + 7] = half_capgd;
+        circuit.states[0][self.state_idx + 10] = half_capgb;
+
+        let mut gcgs = 0.0;
+        let mut ceqgs = 0.0;
+        let mut gcgd = 0.0;
+        let mut ceqgd = 0.0;
+        let mut gcgb = 0.0;
+        let mut ceqgb = 0.0;
+
+        if circuit.delta == 0.0 {
+            let capgs = 2.0 * half_capgs + gs_ovl_cap;
+            let capgd = 2.0 * half_capgd + gd_ovl_cap;
+            let capgb = 2.0 * half_capgb + gb_ovl_cap;
+            self.capgs = capgs;
+            self.capgd = capgd;
+            self.capgb = capgb;
+            circuit.states[0][self.state_idx + 5] = vgs * capgs;
+            circuit.states[0][self.state_idx + 8] = vgd * capgd;
+            circuit.states[0][self.state_idx + 11] = vgb * capgb;
+        } else {
+            let vgs1 = circuit.states[1][self.state_idx + 2];
+            let vgd1 = vgs1 - circuit.states[1][self.state_idx + 3];
+            let vgb1 = vgs1 - circuit.states[1][self.state_idx + 1];
+
+            let capgs = half_capgs + circuit.states[1][self.state_idx + 4] + gs_ovl_cap;
+            let capgd = half_capgd + circuit.states[1][self.state_idx + 7] + gd_ovl_cap;
+            let capgb = half_capgb + circuit.states[1][self.state_idx + 10] + gb_ovl_cap;
+            self.capgs = capgs;
+            self.capgd = capgd;
+            self.capgb = capgb;
+
+            circuit.states[0][self.state_idx + 5] =
+                (vgs - vgs1) * capgs + circuit.states[1][self.state_idx + 5];
+            circuit.states[0][self.state_idx + 8] =
+                (vgd - vgd1) * capgd + circuit.states[1][self.state_idx + 8];
+            circuit.states[0][self.state_idx + 11] =
+                (vgb - vgb1) * capgb + circuit.states[1][self.state_idx + 11];
+
+            if capgs > 0.0 {
+                integrate(circuit, &mut gcgs, &mut ceqgs, capgs, self.state_idx + 5);
+                let ag0 = 2.0 / circuit.delta;
+                ceqgs = ceqgs - gcgs * vgs + ag0 * circuit.states[0][self.state_idx + 5];
+            } else {
+                circuit.states[0][self.state_idx + 6] = 0.0;
+            }
+            if capgd > 0.0 {
+                integrate(circuit, &mut gcgd, &mut ceqgd, capgd, self.state_idx + 8);
+                let ag0 = 2.0 / circuit.delta;
+                ceqgd = ceqgd - gcgd * vgd + ag0 * circuit.states[0][self.state_idx + 8];
+            } else {
+                circuit.states[0][self.state_idx + 9] = 0.0;
+            }
+            if capgb > 0.0 {
+                integrate(circuit, &mut gcgb, &mut ceqgb, capgb, self.state_idx + 11);
+                let ag0 = 2.0 / circuit.delta;
+                ceqgb = ceqgb - gcgb * vgb + ag0 * circuit.states[0][self.state_idx + 11];
+            } else {
+                circuit.states[0][self.state_idx + 12] = 0.0;
+            }
+        }
+
         // Compute equivalents
         let ceqbs = self.type_multiplier * (self.cbs - (self.gbs - circuit.gmin) * vbs);
         let ceqbd = self.type_multiplier * (self.cbd - (self.gbd - circuit.gmin) * vbd);
@@ -478,14 +587,6 @@ impl Device for Mos1 {
             cdreq = -self.type_multiplier
                 * (cdrain - self.gds * (-vds) - self.gm * vgd - self.gmbs * vbd);
         }
-
-        // We ignore transient Meyer's capacitances since we are focusing on DCOP right now.
-        let ceqgs = 0.0;
-        let ceqgb = 0.0;
-        let ceqgd = 0.0;
-        let gcgs = 0.0;
-        let gcgb = 0.0;
-        let gcgd = 0.0;
 
         // Load Excitation current vector (RHS)
         if self.g_node != 0 {

@@ -1,7 +1,6 @@
 use super::Device;
 use crate::circuit::Circuit;
 use crate::node::NodeType;
-use spice_math::spdefs::MatrixFrame;
 
 pub struct VoltageSource {
     pub name: String,

@@ -93,3 +93,47 @@ pub fn dev_fetlim(mut vnew: f64, vold: f64, vto: f64) -> f64 {
     }
     vnew
 }
+
+/// Compute the MOS overlap capacitances (1/2 of non-constant portion) as functions
+/// of the device terminal voltages (1:1 port of `DEVqmeyer` in `devsup.c`).
+pub fn dev_qmeyer(
+    vgs: f64,
+    vgd: f64,
+    _vgb: f64,
+    von: f64,
+    vdsat: f64,
+    capgs: &mut f64,
+    capgd: &mut f64,
+    capgb: &mut f64,
+    phi: f64,
+    cox: f64,
+) {
+    let vgst = vgs - von;
+    if vgst <= -phi {
+        *capgb = cox / 2.0;
+        *capgs = 0.0;
+        *capgd = 0.0;
+    } else if vgst <= -phi / 2.0 {
+        *capgb = -vgst * cox / (2.0 * phi);
+        *capgs = 0.0;
+        *capgd = 0.0;
+    } else if vgst <= 0.0 {
+        *capgb = -vgst * cox / (2.0 * phi);
+        *capgs = vgst * cox / (1.5 * phi) + cox / 3.0;
+        *capgd = 0.0;
+    } else {
+        let vds = vgs - vgd;
+        if vdsat <= vds {
+            *capgs = cox / 3.0;
+            *capgd = 0.0;
+            *capgb = 0.0;
+        } else {
+            let vddif = 2.0 * vdsat - vds;
+            let vddif1 = vdsat - vds;
+            let vddif2 = vddif * vddif;
+            *capgd = cox * (1.0 - vdsat * vdsat / vddif2) / 3.0;
+            *capgs = cox * (1.0 - vddif1 * vddif1 / vddif2) / 3.0;
+            *capgb = 0.0;
+        }
+    }
+}

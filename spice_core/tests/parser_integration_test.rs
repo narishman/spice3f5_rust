@@ -52,3 +52,35 @@ fn test_spice_parser_integration() {
     assert!((v_in - 20.0).abs() < 1e-6);
     assert!((v_out - 10.0).abs() < 1e-6);
 }
+
+#[test]
+fn test_full_netlist_lexer_parser_mos_and_bjt() {
+    use spice_parse::{lexer::Lexer, parser::Parser};
+
+    let netlist = "
+    * NMOS Common Source Amplifier Netlist
+    VDD vdd 0 DC 5.0
+    VG gate 0 DC 3.0
+    RD vdd drain 10k
+    M1 drain gate 0 0 NMOD W=100u L=100u
+    .MODEL NMOD NMOS (VTO=1.0 KP=20u)
+    .END
+    ";
+
+    let mut lexer = Lexer::new(netlist);
+    let tokens = lexer.tokenize();
+    let mut parser = Parser::new(tokens);
+    let ast_stmts = parser.parse().unwrap();
+
+    let mut circuit = Circuit::new();
+    let mut devices = load_from_ast(&mut circuit, ast_stmts).unwrap();
+
+    do_dc_op(&mut circuit, &mut devices).expect("Netlist DC OP failed");
+
+    let drain_idx = circuit.node_map["drain"];
+    assert!(
+        (circuit.rhs[drain_idx] - 4.6).abs() < 1e-3,
+        "Expected drain voltage 4.6V, got {}",
+        circuit.rhs[drain_idx]
+    );
+}

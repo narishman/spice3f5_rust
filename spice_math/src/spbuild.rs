@@ -1,7 +1,6 @@
 use crate::spdefs::{MatrixElement, MatrixFrame};
 
 /// Translation array expansion.
-const MINIMUM_ALLOCATED_SIZE: usize = 6;
 const EXPANDABLE: bool = true;
 const TRANSLATE: bool = true;
 
@@ -177,7 +176,7 @@ impl MatrixFrame {
     }
 
     /// CREATE AND SPLICE ELEMENT INTO MATRIX (spcCreateElement)
-    fn create_element(
+    pub(crate) fn create_element(
         &mut self,
         row: usize,
         col: usize,
@@ -195,10 +194,14 @@ impl MatrixFrame {
             next_in_col: None,
         };
 
+        if fillin {
+            self.fillins += 1;
+        } else {
+            self.elements += 1;
+        }
+
         if self.rows_linked {
-            if fillin {
-                self.fillins += 1;
-            } else {
+            if !fillin {
                 self.needs_ordering = true;
             }
 

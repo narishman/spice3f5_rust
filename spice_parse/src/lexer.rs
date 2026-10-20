@@ -1,12 +1,44 @@
 use nom::{
     IResult,
     branch::alt,
-    bytes::complete::{tag_no_case, take_while1},
-    character::complete::{alpha1, alphanumeric1, char, multispace0, space0, space1},
-    combinator::{map, opt, recognize},
+    bytes::complete::{tag, tag_no_case, take_while1},
+    character::complete::space0,
+    combinator::{opt, recognize},
     number::complete::double,
-    sequence::{delimited, pair, tuple},
+    sequence::{delimited, pair, separated_pair},
 };
+
+/// Line-oriented Lexer for multi-line SPICE netlists
+#[derive(Debug, Clone)]
+pub struct Lexer<'a> {
+    input: &'a str,
+}
+
+impl<'a> Lexer<'a> {
+    pub fn new(input: &'a str) -> Self {
+        Self { input }
+    }
+
+    /// Tokenize a netlist into logical SPICE lines (handling `+` line continuations and trimming empty lines)
+    pub fn tokenize(&mut self) -> Vec<String> {
+        let mut lines: Vec<String> = Vec::new();
+        for raw_line in self.input.lines() {
+            let trimmed = raw_line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Some(rest) = trimmed.strip_prefix('+') {
+                if let Some(last) = lines.last_mut() {
+                    last.push(' ');
+                    last.push_str(rest.trim());
+                    continue;
+                }
+            }
+            lines.push(trimmed.to_string());
+        }
+        lines
+    }
+}
 
 /// Consume leading whitespace except newlines
 pub fn sp(i: &str) -> IResult<&str, &str> {
@@ -25,6 +57,13 @@ pub fn identifier(input: &str) -> IResult<&str, String> {
         Err(_) => take_while1(|c: char| c.is_alphanumeric() || c == '_')(input)?,
     };
     Ok((input, out.to_string()))
+}
+
+/// Parse a `KEY=VALUE` parameter assignment (e.g., `W=10u`, `BF=100`)
+pub fn param_pair(input: &str) -> IResult<&str, (String, f64)> {
+    let (input, (k, v)) =
+        separated_pair(identifier, delimited(sp, tag("="), sp), spice_val)(input)?;
+    Ok((input, (k.to_uppercase(), v)))
 }
 
 /// Parse SPICE floats with SI Suffixes exactly like INPevaluate

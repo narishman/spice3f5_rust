@@ -1,5 +1,4 @@
 use super::Device;
-use spice_math::spdefs::MatrixFrame;
 
 use crate::circuit::Circuit;
 

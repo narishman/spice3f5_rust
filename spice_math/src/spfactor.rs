@@ -6,7 +6,7 @@
 //! This module contains the routines to factor the matrix into LU form using
 //! the Markowitz pivot strategy customized for sparse circuit matrices.
 
-use crate::spdefs::{MatrixElement, MatrixFrame};
+use crate::spdefs::MatrixFrame;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum PartitionMode {
@@ -84,13 +84,11 @@ impl MatrixFrame {
                 return self.error;
             }
         } else {
-            // First time factorization
+            // First time factorization (or matrix structure changed)
             if !self.rows_linked {
                 self.link_rows();
             }
-            if !self.internal_vectors_allocated {
-                self.create_internal_vectors();
-            }
+            self.create_internal_vectors();
             if self.error >= 2 {
                 // spFATAL
                 return self.error;
@@ -152,63 +150,66 @@ impl MatrixFrame {
             return self.factor_complex_matrix();
         }
 
-        let pivot_idx = self.diag[1].expect("Diagonal element 1 missing in factored matrix");
+        let pivot_idx = match self.diag[1] {
+            Some(idx) => idx,
+            None => return self.zero_pivot(1),
+        };
         if self.elements_arena[pivot_idx].real == 0.0 {
             return self.zero_pivot(1);
         }
         self.elements_arena[pivot_idx].real = 1.0 / self.elements_arena[pivot_idx].real;
 
         for step in 2..=self.size {
-            if self.do_real_direct[step] {
-                // Scatter
-                let mut p_elem_idx = self.first_in_col[step];
-                while let Some(idx) = p_elem_idx {
-                    let row = self.elements_arena[idx].row;
-                    self.intermediate[row] = self.elements_arena[idx].real;
-                    p_elem_idx = self.elements_arena[idx].next_in_col;
-                }
-
-                // Update
-                let mut p_col_idx = self.first_in_col[step];
-                while let Some(col_idx) = p_col_idx {
-                    let col_row = self.elements_arena[col_idx].row;
-                    if col_row >= step {
-                        break;
-                    }
-
-                    let p_diag_idx = self.diag[col_row].unwrap();
-                    let diag_real = self.elements_arena[p_diag_idx].real;
-
-                    self.elements_arena[col_idx].real = self.intermediate[col_row] * diag_real;
-                    let mult = self.elements_arena[col_idx].real;
-
-                    let mut p_elem2_idx = self.elements_arena[p_diag_idx].next_in_col;
-                    while let Some(idx2) = p_elem2_idx {
-                        let row2 = self.elements_arena[idx2].row;
-                        self.intermediate[row2] -= mult * self.elements_arena[idx2].real;
-                        p_elem2_idx = self.elements_arena[idx2].next_in_col;
-                    }
-
-                    p_col_idx = self.elements_arena[col_idx].next_in_col;
-                }
-
-                // Gather
-                let mut p_elem3_idx = self.elements_arena[self.diag[step].unwrap()].next_in_col;
-                while let Some(idx3) = p_elem3_idx {
-                    let row3 = self.elements_arena[idx3].row;
-                    self.elements_arena[idx3].real = self.intermediate[row3];
-                    p_elem3_idx = self.elements_arena[idx3].next_in_col;
-                }
-
-                if self.intermediate[step] == 0.0 {
-                    return self.zero_pivot(step);
-                }
-
-                self.elements_arena[self.diag[step].unwrap()].real = 1.0 / self.intermediate[step];
-            } else {
-                // Indirect addressing (omitted for brevity, translates similarly relying on intermediate vecs)
-                // In safe rust, since intermediate tracks values directly, we don't need pointer arrays.
+            // In safe Rust using contiguous arena vectors, both direct and indirect
+            // partition modes execute via the intermediate scatter-update-gather buffer.
+            let mut p_elem_idx = self.first_in_col[step];
+            while let Some(idx) = p_elem_idx {
+                let row = self.elements_arena[idx].row;
+                self.intermediate[row] = self.elements_arena[idx].real;
+                p_elem_idx = self.elements_arena[idx].next_in_col;
             }
+
+            // Update
+            let mut p_col_idx = self.first_in_col[step];
+            while let Some(col_idx) = p_col_idx {
+                let col_row = self.elements_arena[col_idx].row;
+                if col_row >= step {
+                    break;
+                }
+
+                let p_diag_idx = self.diag[col_row].unwrap();
+                let diag_real = self.elements_arena[p_diag_idx].real;
+
+                self.elements_arena[col_idx].real = self.intermediate[col_row] * diag_real;
+                let mult = self.elements_arena[col_idx].real;
+
+                let mut p_elem2_idx = self.elements_arena[p_diag_idx].next_in_col;
+                while let Some(idx2) = p_elem2_idx {
+                    let row2 = self.elements_arena[idx2].row;
+                    self.intermediate[row2] -= mult * self.elements_arena[idx2].real;
+                    p_elem2_idx = self.elements_arena[idx2].next_in_col;
+                }
+
+                p_col_idx = self.elements_arena[col_idx].next_in_col;
+            }
+
+            // Gather
+            let step_diag_idx = match self.diag[step] {
+                Some(idx) => idx,
+                None => return self.zero_pivot(step),
+            };
+            let mut p_elem3_idx = self.elements_arena[step_diag_idx].next_in_col;
+            while let Some(idx3) = p_elem3_idx {
+                let row3 = self.elements_arena[idx3].row;
+                self.elements_arena[idx3].real = self.intermediate[row3];
+                p_elem3_idx = self.elements_arena[idx3].next_in_col;
+            }
+
+            if self.intermediate[step] == 0.0 {
+                return self.zero_pivot(step);
+            }
+
+            self.elements_arena[step_diag_idx].real = 1.0 / self.intermediate[step];
         }
 
         self.factored = true;
@@ -218,8 +219,94 @@ impl MatrixFrame {
 
     /// FACTOR COMPLEX MATRIX
     fn factor_complex_matrix(&mut self) -> i32 {
-        // Implementation stub for complex factoring
-        0
+        let pivot_idx = match self.diag[1] {
+            Some(idx) => idx,
+            None => return self.zero_pivot(1),
+        };
+        if self.element_mag(pivot_idx) == 0.0 {
+            return self.zero_pivot(1);
+        }
+        let (pr, pi) = Self::cmplx_reciprocal(
+            self.elements_arena[pivot_idx].real,
+            self.elements_arena[pivot_idx].imag,
+        );
+        self.elements_arena[pivot_idx].real = pr;
+        self.elements_arena[pivot_idx].imag = pi;
+
+        // Ensure intermediate has space for 2 * (size + 1)
+        if self.intermediate.len() < 2 * (self.size + 1) {
+            self.intermediate.resize(2 * (self.size + 1), 0.0);
+        }
+
+        for step in 2..=self.size {
+            // Scatter complex values into self.intermediate[2*row] and self.intermediate[2*row + 1]
+            let mut p_elem_idx = self.first_in_col[step];
+            while let Some(idx) = p_elem_idx {
+                let row = self.elements_arena[idx].row;
+                self.intermediate[2 * row] = self.elements_arena[idx].real;
+                self.intermediate[2 * row + 1] = self.elements_arena[idx].imag;
+                p_elem_idx = self.elements_arena[idx].next_in_col;
+            }
+
+            // Update column
+            let mut p_col_idx = self.first_in_col[step];
+            while let Some(col_idx) = p_col_idx {
+                let col_row = self.elements_arena[col_idx].row;
+                if col_row >= step {
+                    break;
+                }
+
+                let p_diag_idx = self.diag[col_row].unwrap();
+                let dr = self.elements_arena[p_diag_idx].real;
+                let di = self.elements_arena[p_diag_idx].imag;
+                let sr = self.intermediate[2 * col_row];
+                let si = self.intermediate[2 * col_row + 1];
+
+                // Mult = Dest[col_row] * Diag[col_row]
+                let mult_r = sr * dr - si * di;
+                let mult_i = sr * di + si * dr;
+                self.elements_arena[col_idx].real = mult_r;
+                self.elements_arena[col_idx].imag = mult_i;
+
+                let mut p_elem2_idx = self.elements_arena[p_diag_idx].next_in_col;
+                while let Some(idx2) = p_elem2_idx {
+                    let row2 = self.elements_arena[idx2].row;
+                    let er = self.elements_arena[idx2].real;
+                    let ei = self.elements_arena[idx2].imag;
+                    self.intermediate[2 * row2] -= mult_r * er - mult_i * ei;
+                    self.intermediate[2 * row2 + 1] -= mult_r * ei + mult_i * er;
+                    p_elem2_idx = self.elements_arena[idx2].next_in_col;
+                }
+
+                p_col_idx = self.elements_arena[col_idx].next_in_col;
+            }
+
+            // Gather
+            let step_diag_idx = match self.diag[step] {
+                Some(idx) => idx,
+                None => return self.zero_pivot(step),
+            };
+            let mut p_elem3_idx = self.elements_arena[step_diag_idx].next_in_col;
+            while let Some(idx3) = p_elem3_idx {
+                let row3 = self.elements_arena[idx3].row;
+                self.elements_arena[idx3].real = self.intermediate[2 * row3];
+                self.elements_arena[idx3].imag = self.intermediate[2 * row3 + 1];
+                p_elem3_idx = self.elements_arena[idx3].next_in_col;
+            }
+
+            let piv_r = self.intermediate[2 * step];
+            let piv_i = self.intermediate[2 * step + 1];
+            if piv_r.abs() + piv_i.abs() == 0.0 {
+                return self.zero_pivot(step);
+            }
+            let (rec_r, rec_i) = Self::cmplx_reciprocal(piv_r, piv_i);
+            self.elements_arena[step_diag_idx].real = rec_r;
+            self.elements_arena[step_diag_idx].imag = rec_i;
+        }
+
+        self.factored = true;
+        self.error = 0;
+        self.error
     }
 
     /// CREATE INTERNAL VECTORS
@@ -231,23 +318,80 @@ impl MatrixFrame {
         self.do_real_direct.resize(self.size + 1, false);
         self.do_cmplx_direct.resize(self.size + 1, false);
 
-        self.intermediate.resize(self.size + 1, 0.0);
+        let inter_size = if self.complex {
+            2 * (self.size + 1)
+        } else {
+            self.size + 1
+        };
+        self.intermediate.resize(inter_size, 0.0);
         self.internal_vectors_allocated = true;
     }
 
     /// PARTITION MATRIX
-    fn partition(&mut self, mode: PartitionMode) {
+    pub fn partition(&mut self, mode: PartitionMode) {
         if self.partitioned {
             return;
         }
 
-        // Emulates cost counting of operations for direct vs indirect sparse arrays
-        // Stub implementation, sets to indirect safely
-        for step in 1..=self.size {
-            self.do_real_direct.push(false);
-            self.do_cmplx_direct.push(false);
-        }
+        self.do_real_direct.resize(self.size + 1, false);
+        self.do_cmplx_direct.resize(self.size + 1, false);
         self.partitioned = true;
+
+        let effective_mode = match mode {
+            PartitionMode::DefaultPartition => PartitionMode::AutoPartition,
+            other => other,
+        };
+
+        match effective_mode {
+            PartitionMode::DirectPartition => {
+                for step in 1..=self.size {
+                    self.do_real_direct[step] = true;
+                    self.do_cmplx_direct[step] = true;
+                }
+                return;
+            }
+            PartitionMode::IndirectPartition => {
+                for step in 1..=self.size {
+                    self.do_real_direct[step] = false;
+                    self.do_cmplx_direct[step] = false;
+                }
+                return;
+            }
+            PartitionMode::AutoPartition | PartitionMode::DefaultPartition => {}
+        }
+
+        // Count all operations needed in factoring matrix (1:1 with spPartition)
+        for step in 1..=self.size {
+            let mut nc = 0usize;
+            let mut no = 0usize;
+            let mut nm = 0usize;
+
+            let mut p_element = self.first_in_col[step];
+            while let Some(idx) = p_element {
+                nc += 1;
+                p_element = self.elements_arena[idx].next_in_col;
+            }
+
+            let mut p_column = self.first_in_col[step];
+            while let Some(col_idx) = p_column {
+                let col_row = self.elements_arena[col_idx].row;
+                if col_row >= step {
+                    break;
+                }
+                if let Some(diag_idx) = self.diag[col_row] {
+                    nm += 1;
+                    let mut p_sub = self.elements_arena[diag_idx].next_in_col;
+                    while let Some(sub_idx) = p_sub {
+                        no += 1;
+                        p_sub = self.elements_arena[sub_idx].next_in_col;
+                    }
+                }
+                p_column = self.elements_arena[col_idx].next_in_col;
+            }
+
+            self.do_real_direct[step] = (nm + no) as isize > (3 * nc as isize - 2 * nm as isize);
+            self.do_cmplx_direct[step] = (nm + no) as isize > (7 * nc as isize - 4 * nm as isize);
+        }
     }
 
     fn search_entire_matrix(&mut self, step: usize) -> Option<usize> {
@@ -759,7 +903,62 @@ impl MatrixFrame {
         }
     }
 
-    fn update_markowitz_numbers(&mut self, pivot_idx: usize) {}
+    fn update_markowitz_numbers(&mut self, pivot_idx: usize) {
+        let mut col_ptr = self.elements_arena[pivot_idx].next_in_col;
+        while let Some(c_idx) = col_ptr {
+            let row = self.elements_arena[c_idx].row;
+            self.markowitz_row[row] = self.markowitz_row[row].saturating_sub(1);
+            self.markowitz_prod[row] =
+                self.markowitz_row[row].saturating_mul(self.markowitz_col[row]);
+            if self.markowitz_row[row] == 0 {
+                self.singletons += 1;
+            }
+            col_ptr = self.elements_arena[c_idx].next_in_col;
+        }
+
+        let mut row_ptr = self.elements_arena[pivot_idx].next_in_row;
+        while let Some(r_idx) = row_ptr {
+            let col = self.elements_arena[r_idx].col;
+            self.markowitz_col[col] = self.markowitz_col[col].saturating_sub(1);
+            self.markowitz_prod[col] =
+                self.markowitz_row[col].saturating_mul(self.markowitz_col[col]);
+            if self.markowitz_col[col] == 0 && self.markowitz_row[col] != 0 {
+                self.singletons += 1;
+            }
+            row_ptr = self.elements_arena[r_idx].next_in_row;
+        }
+    }
+
+    fn create_fillin(&mut self, row: usize, col: usize) -> Option<usize> {
+        let mut p_element = self.first_in_col[col];
+        let mut prev_idx = None;
+        while let Some(idx) = p_element {
+            if self.elements_arena[idx].row < row {
+                prev_idx = Some(idx);
+                p_element = self.elements_arena[idx].next_in_col;
+            } else {
+                break;
+            }
+        }
+
+        let fillin_idx = self.create_element(row, col, prev_idx, true)?;
+
+        // Update Markowitz counts and products (1:1 with CreateFillin in spfactor.c)
+        self.markowitz_row[row] += 1;
+        self.markowitz_prod[row] = self.markowitz_row[row].saturating_mul(self.markowitz_col[row]);
+        if self.markowitz_row[row] == 1 && self.markowitz_col[row] != 0 {
+            self.singletons = self.singletons.saturating_sub(1);
+        }
+
+        self.markowitz_col[col] += 1;
+        self.markowitz_prod[col] = self.markowitz_col[col].saturating_mul(self.markowitz_row[col]);
+        if self.markowitz_row[col] != 0 && self.markowitz_col[col] == 1 {
+            self.singletons = self.singletons.saturating_sub(1);
+        }
+
+        Some(fillin_idx)
+    }
+
     fn link_rows(&mut self) {
         // Build row links from column links
         for col in 1..=self.size {
@@ -793,6 +992,7 @@ impl MatrixFrame {
         }
         self.rows_linked = true;
     }
+
     fn zero_pivot(&mut self, step: usize) -> i32 {
         self.error = 2; // spZERO_DIAG
         self.singular_row = self.int_to_ext_row_map[step];
@@ -800,7 +1000,20 @@ impl MatrixFrame {
         2
     }
 
-    // Mathematical utility stubs
+    pub(crate) fn cmplx_reciprocal(den_r: f64, den_i: f64) -> (f64, f64) {
+        if (den_r >= den_i && den_r > -den_i) || (den_r < den_i && den_r <= -den_i) {
+            let r = den_i / den_r;
+            let out_r = 1.0 / (den_r + r * den_i);
+            let out_i = -r * out_r;
+            (out_r, out_i)
+        } else {
+            let r = den_r / den_i;
+            let out_i = -1.0 / (den_i + r * den_r);
+            let out_r = -r * out_i;
+            (out_r, out_i)
+        }
+    }
+
     fn element_mag(&self, idx: usize) -> f64 {
         let elem = &self.elements_arena[idx];
         if self.complex {
@@ -866,12 +1079,15 @@ impl MatrixFrame {
         let mut p_upper = self.elements_arena[pivot_idx].next_in_row;
         while let Some(u_idx) = p_upper {
             self.elements_arena[u_idx].real *= pivot_val;
+            let u_real = self.elements_arena[u_idx].real;
+            let u_col = self.elements_arena[u_idx].col;
 
             let mut p_sub = self.elements_arena[u_idx].next_in_col;
             let mut p_lower = self.elements_arena[pivot_idx].next_in_col;
 
             while let Some(l_idx) = p_lower {
                 let row = self.elements_arena[l_idx].row;
+                let l_real = self.elements_arena[l_idx].real;
 
                 while let Some(sub_idx) = p_sub {
                     if self.elements_arena[sub_idx].row < row {
@@ -881,30 +1097,84 @@ impl MatrixFrame {
                     }
                 }
 
-                if let Some(sub_idx) = p_sub {
-                    if self.elements_arena[sub_idx].row == row {
-                        self.elements_arena[sub_idx].real -=
-                            self.elements_arena[u_idx].real * self.elements_arena[l_idx].real;
-                        p_sub = self.elements_arena[sub_idx].next_in_col;
-                    } else {
-                        panic!(
-                            "Fill-in required at [{},{}]. Fill-ins are not fully translated yet.",
-                            row, self.elements_arena[u_idx].col
-                        );
-                    }
-                } else {
-                    panic!(
-                        "Fill-in required at [{},{}]. Fill-ins are not fully translated yet.",
-                        row, self.elements_arena[u_idx].col
-                    );
-                }
+                let target_sub_idx = match p_sub {
+                    Some(sub_idx) if self.elements_arena[sub_idx].row == row => sub_idx,
+                    _ => match self.create_fillin(row, u_col) {
+                        Some(fill_idx) => fill_idx,
+                        None => {
+                            self.error = 4; // spNO_MEMORY
+                            return;
+                        }
+                    },
+                };
 
+                self.elements_arena[target_sub_idx].real -= u_real * l_real;
+                p_sub = self.elements_arena[target_sub_idx].next_in_col;
                 p_lower = self.elements_arena[l_idx].next_in_col;
             }
             p_upper = self.elements_arena[u_idx].next_in_row;
         }
     }
-    fn complex_row_col_elimination(&mut self, pivot_idx: usize) {}
+
+    fn complex_row_col_elimination(&mut self, pivot_idx: usize) {
+        if self.element_mag(pivot_idx) == 0.0 {
+            self.matrix_is_singular(self.elements_arena[pivot_idx].row);
+            return;
+        }
+
+        let (piv_r, piv_i) = Self::cmplx_reciprocal(
+            self.elements_arena[pivot_idx].real,
+            self.elements_arena[pivot_idx].imag,
+        );
+        self.elements_arena[pivot_idx].real = piv_r;
+        self.elements_arena[pivot_idx].imag = piv_i;
+
+        let mut p_upper = self.elements_arena[pivot_idx].next_in_row;
+        while let Some(u_idx) = p_upper {
+            let ur0 = self.elements_arena[u_idx].real;
+            let ui0 = self.elements_arena[u_idx].imag;
+            let u_real = ur0 * piv_r - ui0 * piv_i;
+            let u_imag = ur0 * piv_i + ui0 * piv_r;
+            self.elements_arena[u_idx].real = u_real;
+            self.elements_arena[u_idx].imag = u_imag;
+            let u_col = self.elements_arena[u_idx].col;
+
+            let mut p_sub = self.elements_arena[u_idx].next_in_col;
+            let mut p_lower = self.elements_arena[pivot_idx].next_in_col;
+
+            while let Some(l_idx) = p_lower {
+                let row = self.elements_arena[l_idx].row;
+                let l_real = self.elements_arena[l_idx].real;
+                let l_imag = self.elements_arena[l_idx].imag;
+
+                while let Some(sub_idx) = p_sub {
+                    if self.elements_arena[sub_idx].row < row {
+                        p_sub = self.elements_arena[sub_idx].next_in_col;
+                    } else {
+                        break;
+                    }
+                }
+
+                let target_sub_idx = match p_sub {
+                    Some(sub_idx) if self.elements_arena[sub_idx].row == row => sub_idx,
+                    _ => match self.create_fillin(row, u_col) {
+                        Some(fill_idx) => fill_idx,
+                        None => {
+                            self.error = 4; // spNO_MEMORY
+                            return;
+                        }
+                    },
+                };
+
+                self.elements_arena[target_sub_idx].real -= u_real * l_real - u_imag * l_imag;
+                self.elements_arena[target_sub_idx].imag -= u_real * l_imag + u_imag * l_real;
+                p_sub = self.elements_arena[target_sub_idx].next_in_col;
+                p_lower = self.elements_arena[l_idx].next_in_col;
+            }
+            p_upper = self.elements_arena[u_idx].next_in_row;
+        }
+    }
+
     fn count_markowitz(&mut self, rhs: Option<&[f64]>, step: usize) {
         // Generate MarkowitzRow Count for each row
         for i in step..=self.size {
@@ -920,15 +1190,11 @@ impl MatrixFrame {
 
             if let Some(rhs_vec) = rhs {
                 let ext_row = self.int_to_ext_row_map[i];
-                if ext_row < rhs_vec.len() {
-                    // For simplicity in Rust translation, assuming RHS is not complex here
-                    // or handled by wrapping logic if complex vector was provided.
-                    if rhs_vec[ext_row] != 0.0 {
-                        count += 1;
-                    }
+                if ext_row < rhs_vec.len() && rhs_vec[ext_row] != 0.0 {
+                    count += 1;
                 }
             }
-            self.markowitz_row[i] = count as usize;
+            self.markowitz_row[i] = count.max(0) as usize;
         }
 
         // Generate MarkowitzCol count for each column
@@ -942,7 +1208,7 @@ impl MatrixFrame {
                 }
                 p_element = self.elements_arena[idx].next_in_col;
             }
-            self.markowitz_col[i] = count as usize;
+            self.markowitz_col[i] = count.max(0) as usize;
         }
     }
 
@@ -953,8 +1219,8 @@ impl MatrixFrame {
             let row_cnt = self.markowitz_row[i];
             let col_cnt = self.markowitz_col[i];
 
-            let product = (row_cnt as i64) * (col_cnt as i64);
-            self.markowitz_prod[i] = product as usize;
+            let product = row_cnt.saturating_mul(col_cnt);
+            self.markowitz_prod[i] = product;
 
             if product == 0 {
                 self.singletons += 1;
@@ -963,17 +1229,241 @@ impl MatrixFrame {
     }
 
     fn search_for_singleton(&mut self, step: usize) -> Option<usize> {
-        None
-    }
-    fn quickly_search_diagonal(&mut self, step: usize) -> Option<usize> {
-        None
-    }
-    fn search_diagonal(&mut self, step: usize) -> Option<usize> {
+        // Inspect `step` first (since choosing Diag[step] requires no row/col interchanges),
+        // then `size` down to `step + 1` (1:1 with SearchForSingleton in spfactor.c).
+        let mut singletons_left = self.singletons;
+        if singletons_left == 0 {
+            return None;
+        }
+        self.singletons -= 1;
+
+        let iter = std::iter::once(step).chain((step + 1..=self.size).rev());
+        for i in iter {
+            if singletons_left == 0 {
+                break;
+            }
+            if self.markowitz_prod[i] != 0 {
+                continue;
+            }
+            singletons_left -= 1;
+
+            if let Some(chosen_pivot) = self.diag[i] {
+                let pivot_mag = self.element_mag(chosen_pivot);
+                if pivot_mag > self.abs_threshold
+                    && pivot_mag
+                        > self.rel_threshold * self.find_biggest_in_col_exclude(chosen_pivot, step)
+                {
+                    return Some(chosen_pivot);
+                }
+            } else if self.markowitz_col[i] == 0 {
+                let mut curr = self.first_in_col[i];
+                while let Some(idx) = curr {
+                    if self.elements_arena[idx].row >= step {
+                        break;
+                    }
+                    curr = self.elements_arena[idx].next_in_col;
+                }
+                if let Some(chosen_pivot) = curr {
+                    let pivot_mag = self.element_mag(chosen_pivot);
+                    if pivot_mag > self.abs_threshold
+                        && pivot_mag
+                            > self.rel_threshold
+                                * self.find_biggest_in_col_exclude(chosen_pivot, step)
+                    {
+                        return Some(chosen_pivot);
+                    }
+                }
+                if self.markowitz_row[i] == 0 {
+                    let mut rcurr = self.first_in_row[i];
+                    while let Some(idx) = rcurr {
+                        if self.elements_arena[idx].col >= step {
+                            break;
+                        }
+                        rcurr = self.elements_arena[idx].next_in_row;
+                    }
+                    if let Some(chosen_pivot) = rcurr {
+                        let pivot_mag = self.element_mag(chosen_pivot);
+                        if pivot_mag > self.abs_threshold
+                            && pivot_mag
+                                > self.rel_threshold
+                                    * self.find_biggest_in_col_exclude(chosen_pivot, step)
+                        {
+                            return Some(chosen_pivot);
+                        }
+                    }
+                }
+            } else {
+                let mut rcurr = self.first_in_row[i];
+                while let Some(idx) = rcurr {
+                    if self.elements_arena[idx].col >= step {
+                        break;
+                    }
+                    rcurr = self.elements_arena[idx].next_in_row;
+                }
+                if let Some(chosen_pivot) = rcurr {
+                    let pivot_mag = self.element_mag(chosen_pivot);
+                    if pivot_mag > self.abs_threshold
+                        && pivot_mag
+                            > self.rel_threshold
+                                * self.find_biggest_in_col_exclude(chosen_pivot, step)
+                    {
+                        return Some(chosen_pivot);
+                    }
+                }
+            }
+        }
+
+        // All singletons were unacceptable; restore count
+        self.singletons += 1;
         None
     }
 
-    fn search_for_pivot(&mut self, step: usize, diag_pivoting: bool) -> Option<usize> {
+    fn quickly_search_diagonal(&mut self, step: usize) -> Option<usize> {
+        const MAX_MARKOWITZ_TIES: usize = 100;
+        const TIES_MULTIPLIER: usize = 5;
+
+        let mut min_markowitz_product = usize::MAX;
+        let mut tied_elements: Vec<usize> = Vec::with_capacity(MAX_MARKOWITZ_TIES + 1);
+
+        let iter = std::iter::once(step).chain((step + 1..=self.size).rev());
+        for i in iter {
+            let prod = self.markowitz_prod[i];
+            if prod > min_markowitz_product {
+                continue;
+            }
+
+            let p_diag = match self.diag[i] {
+                Some(idx) => idx,
+                None => continue,
+            };
+
+            let magnitude = self.element_mag(p_diag);
+            if magnitude <= self.abs_threshold {
+                continue;
+            }
+
+            if prod == 1 {
+                // Case where only one element exists in row and column other than diagonal
+                let mut p_other_in_row = self.elements_arena[p_diag].next_in_row;
+                let mut p_other_in_col = self.elements_arena[p_diag].next_in_col;
+                if p_other_in_row.is_none() && p_other_in_col.is_none() {
+                    let mut r = self.first_in_row[i];
+                    while let Some(idx) = r {
+                        let c = self.elements_arena[idx].col;
+                        if c >= step && c != i {
+                            p_other_in_row = Some(idx);
+                            break;
+                        }
+                        r = self.elements_arena[idx].next_in_row;
+                    }
+                    let mut c = self.first_in_col[i];
+                    while let Some(idx) = c {
+                        let rw = self.elements_arena[idx].row;
+                        if rw >= step && rw != i {
+                            p_other_in_col = Some(idx);
+                            break;
+                        }
+                        c = self.elements_arena[idx].next_in_col;
+                    }
+                }
+
+                if let (Some(or_idx), Some(oc_idx)) = (p_other_in_row, p_other_in_col) {
+                    if self.elements_arena[or_idx].col == self.elements_arena[oc_idx].row {
+                        let largest_off_diag =
+                            self.element_mag(or_idx).max(self.element_mag(oc_idx));
+                        if magnitude >= largest_off_diag {
+                            return Some(p_diag);
+                        }
+                    }
+                }
+            }
+
+            if prod < min_markowitz_product {
+                tied_elements.clear();
+                tied_elements.push(p_diag);
+                min_markowitz_product = prod;
+            } else if tied_elements.len() <= MAX_MARKOWITZ_TIES {
+                tied_elements.push(p_diag);
+                if tied_elements.len() - 1 >= min_markowitz_product.saturating_mul(TIES_MULTIPLIER)
+                {
+                    break;
+                }
+            }
+        }
+
+        if tied_elements.is_empty() {
+            return None;
+        }
+
         let mut chosen_pivot = None;
+        let mut max_ratio = 1.0 / self.rel_threshold;
+
+        for &p_diag in &tied_elements {
+            let magnitude = self.element_mag(p_diag);
+            let largest_in_col = self.find_biggest_in_col_exclude(p_diag, step);
+            let ratio = largest_in_col / magnitude;
+            if ratio < max_ratio {
+                chosen_pivot = Some(p_diag);
+                max_ratio = ratio;
+            }
+        }
+
+        chosen_pivot
+    }
+
+    fn search_diagonal(&mut self, step: usize) -> Option<usize> {
+        const TIES_MULTIPLIER: usize = 5;
+
+        let mut chosen_pivot = None;
+        let mut min_markowitz_product = usize::MAX;
+        let mut number_of_ties = 0usize;
+        let mut ratio_of_accepted = 0.0;
+
+        let iter = std::iter::once(step).chain((step + 1..=self.size).rev());
+        for i in iter {
+            let prod = self.markowitz_prod[i];
+            if prod > min_markowitz_product {
+                continue;
+            }
+
+            let p_diag = match self.diag[i] {
+                Some(idx) => idx,
+                None => continue,
+            };
+
+            let magnitude = self.element_mag(p_diag);
+            if magnitude <= self.abs_threshold {
+                continue;
+            }
+
+            let largest_in_col = self.find_biggest_in_col_exclude(p_diag, step);
+            if magnitude <= self.rel_threshold * largest_in_col {
+                continue;
+            }
+
+            if prod < min_markowitz_product {
+                chosen_pivot = Some(p_diag);
+                min_markowitz_product = prod;
+                ratio_of_accepted = largest_in_col / magnitude;
+                number_of_ties = 0;
+            } else {
+                number_of_ties += 1;
+                let ratio = largest_in_col / magnitude;
+                if ratio < ratio_of_accepted {
+                    chosen_pivot = Some(p_diag);
+                    ratio_of_accepted = ratio;
+                }
+                if number_of_ties >= min_markowitz_product.saturating_mul(TIES_MULTIPLIER) {
+                    return chosen_pivot;
+                }
+            }
+        }
+
+        chosen_pivot
+    }
+
+    fn search_for_pivot(&mut self, step: usize, diag_pivoting: bool) -> Option<usize> {
+        let mut chosen_pivot;
 
         if self.singletons > 0 {
             chosen_pivot = self.search_for_singleton(step);

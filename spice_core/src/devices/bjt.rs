@@ -291,8 +291,6 @@ impl Device for Bjt {
         }
 
         // Core Gummel-Poon Equivalents
-        let vtn = VT;
-
         // Determine base-emitter current and conductance
         let (cbe, gbe) = if vbe > -5.0 * VT {
             let evbe = (vbe / VT).exp();

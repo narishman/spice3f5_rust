@@ -1,5 +1,4 @@
 use crate::circuit::Circuit;
-use spice_math::spdefs::MatrixFrame;
 
 pub mod bjt;
 pub mod capacitor;

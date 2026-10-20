@@ -58,11 +58,10 @@ impl Device for Inductor {
     }
 
     fn load(&mut self, circuit: &mut Circuit) -> Result<(), String> {
-        if circuit.delta > 0.0 {
-            // Transient integration: compute flux
-            let current = circuit.rhs_old[self.branch_node]; // I_L
-            circuit.states[0][self.state_idx] = self.inductance * current; // Flux Phi = L * I
+        let current = circuit.rhs_old[self.branch_node]; // I_L
+        circuit.states[0][self.state_idx] = self.inductance * current; // Flux Phi = L * I
 
+        if circuit.delta > 0.0 {
             let mut req = 0.0;
             let mut veq = 0.0;
 

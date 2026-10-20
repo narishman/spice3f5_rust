@@ -1,4 +1,3 @@
 [workspace]
-members = ["spice_core",
-    "spice_math"
-, "spice_parse"]
+resolver = "3"
+members = ["spice_core", "spice_math", "spice_parse"]

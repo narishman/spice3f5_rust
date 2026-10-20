@@ -1,7 +1,6 @@
 use crate::spdefs::{MatrixElement, MatrixFrame};
 
 /// MACRO REPLACEMENTS
-const EXPANDABLE: bool = true;
 const TRANSLATE: bool = true;
 const MINIMUM_ALLOCATED_SIZE: usize = 6;
 const SPACE_FOR_ELEMENTS: usize = 6;

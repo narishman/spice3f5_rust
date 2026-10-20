@@ -2,7 +2,8 @@ use crate::circuit::Circuit;
 use crate::devices::{Device, DeviceEnum};
 
 pub fn do_dc_op(circuit: &mut Circuit, devices: &mut [DeviceEnum]) -> Result<(), String> {
-    // 1. First Pass: Matrix setup and Node bindings
+    // 1. First Pass: Matrix setup and Node bindings (idempotent if called multiple times)
+    circuit.num_states = 0;
     for dev in devices.iter_mut() {
         if let Err(e) = dev.setup(circuit) {
             return Err(format!("Error setting up device: {}", e));
@@ -32,7 +33,6 @@ pub fn do_dc_op(circuit: &mut Circuit, devices: &mut [DeviceEnum]) -> Result<(),
         }
 
         // LU Factorization using sparse matrix math
-        // In the future: handle matrix singularity exceptions and GMIN stepping here.
         let factor_err = circuit.matrix.order_and_factor(
             Some(&circuit.rhs),
             circuit.reltol,
@@ -51,8 +51,6 @@ pub fn do_dc_op(circuit: &mut Circuit, devices: &mut [DeviceEnum]) -> Result<(),
         circuit.matrix.solve(&circuit.rhs, &mut new_states);
 
         // Convergence Test
-        // For linear elements (R, V, I), the Newton-Raphson mathematically converges in 1 pass.
-        // We evaluate tolerance differences between old states and new.
         let mut all_converged = true;
         if circuit.noncon > 0 {
             all_converged = false;
@@ -63,20 +61,13 @@ pub fn do_dc_op(circuit: &mut Circuit, devices: &mut [DeviceEnum]) -> Result<(),
             let tol = circuit.reltol * new_states[i].abs().max(circuit.rhs_old[i].abs())
                 + circuit.volt_tol;
 
-            // If we are iterating non-linear parts, diff > tol fails convergence.
-            // Since we implement only basic linear elements now, we simply break early when converged.
             if diff > tol && iter > 0 {
-                eprintln!(
-                    "Iter {}: Node {} failed convergence. Diff {}, Tol {}, Old {}, New {}",
-                    iter, i, diff, tol, circuit.rhs_old[i], new_states[i]
-                );
                 all_converged = false;
             }
         }
 
-        eprintln!("Iter {}: States evaluated: {:?}", iter, new_states);
         circuit.rhs_old = new_states.clone(); // Correctly track previous solution
-        circuit.rhs = new_states.clone(); // Commit computed result to state buffer
+        circuit.rhs = new_states; // Commit computed result to state buffer
 
         if all_converged && iter > 0 {
             converged = true;

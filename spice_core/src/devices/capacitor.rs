@@ -53,23 +53,23 @@ impl Device for Capacitor {
     }
 
     fn load(&mut self, circuit: &mut Circuit) -> Result<(), String> {
+        let v_n1 = if self.n1 != 0 {
+            circuit.rhs_old[self.n1]
+        } else {
+            0.0
+        };
+        let v_n2 = if self.n2 != 0 {
+            circuit.rhs_old[self.n2]
+        } else {
+            0.0
+        };
+        let v_cap = v_n1 - v_n2;
+
+        // Current charge Q = C * V (stored in both DCOP and transient, 1:1 with capload.c)
+        circuit.states[0][self.state_idx] = self.capacitance * v_cap;
+
         // If transient step
         if circuit.delta > 0.0 {
-            let v_n1 = if self.n1 != 0 {
-                circuit.rhs_old[self.n1]
-            } else {
-                0.0
-            };
-            let v_n2 = if self.n2 != 0 {
-                circuit.rhs_old[self.n2]
-            } else {
-                0.0
-            };
-            let v_cap = v_n1 - v_n2;
-
-            // Current charge Q = C * V
-            circuit.states[0][self.state_idx] = self.capacitance * v_cap;
-
             let mut geq = 0.0;
             let mut ceq = 0.0;
 
